@@ -83,7 +83,8 @@ export async function hasAuth(): Promise<boolean> {
 
 /**
  * 统一的认证 Token 获取
- * 自动处理缓存、签发等逻辑
+ * 优先走服务端签发（/api/github/token，私钥只存在服务端环境变量里）；
+ * 服务端未配置（503）时回退到旧的本地 PEM 流程。
  * @returns GitHub Installation Token
  */
 export async function getAuthToken(): Promise<string> {
@@ -94,10 +95,29 @@ export async function getAuthToken(): Promise<string> {
 		return cachedToken
 	}
 
-	// 2. 获取私钥（从缓存）
+	// 2. 服务端签发模式：PEM 不经过浏览器
+	try {
+		const res = await fetch('/api/github/token', { method: 'POST' })
+		if (res.ok) {
+			const { token } = (await res.json()) as { token: string }
+			if (token) {
+				toast.success('已通过服务端获取安装令牌')
+				saveTokenToCache(token)
+				return token
+			}
+		}
+		if (res.status !== 503) {
+			console.error('[auth] server token issue failed:', res.status)
+		}
+		// 503 = 服务端未配置凭据，走回退
+	} catch (err) {
+		console.warn('[auth] server token endpoint unreachable, falling back to local PEM:', err)
+	}
+
+	// 3. 回退：获取私钥（从缓存）
 	const privateKey = useAuthStore.getState().privateKey
 	if (!privateKey) {
-		throw new Error('需要先设置私钥。请使用 useAuth().setPrivateKey()')
+		throw new Error('需要先设置私钥。请使用 useAuth().setPrivateKey()，或在服务端配置 GITHUB_APP_PRIVATE_KEY')
 	}
 
 	toast.info('正在签发 JWT...')

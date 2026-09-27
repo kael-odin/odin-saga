@@ -35,7 +35,7 @@ function signAppJwt(appId: string, privateKeyPem: string): string {
 	return `${input}.${signature}`
 }
 
-async function getInstallToken(): Promise<string> {
+export async function getInstallToken(): Promise<string> {
 	const appId = process.env.NEXT_PUBLIC_GITHUB_APP_ID || '-'
 	const pem = process.env.GITHUB_APP_PRIVATE_KEY
 	if (!pem) throw new Error('missing credential')
@@ -78,6 +78,30 @@ async function getCredentialCached(): Promise<string | null> {
 
 type LikesMap = Record<string, number>
 
+/** Contents API 读取：附带文件 sha，供 PUT 乐观锁使用（raw 回退无 sha） */
+async function readLikesWithSha(): Promise<{ likes: LikesMap; sha?: string }> {
+	const credential = await getCredentialCached()
+	if (credential) {
+		const res = await fetch(`${GH_API}/repos/${GITHUB_CONFIG.OWNER}/${GITHUB_CONFIG.REPO}/contents/${FILE_PATH}`, {
+			headers: { ...GH_HEADERS, Authorization: `Bearer ${credential}` },
+			cache: 'no-store'
+		})
+		if (res.ok) {
+			const data = (await res.json()) as { content?: string; sha?: string }
+			return {
+				likes: JSON.parse(Buffer.from(data.content ?? '', 'base64').toString('utf-8')) as LikesMap,
+				sha: data.sha
+			}
+		}
+		if (res.status !== 404) throw new Error(`read likes failed: ${res.status}`)
+		return { likes: {} }
+	}
+	const res = await fetch(RAW_URL, { cache: 'no-store' })
+	if (res.status === 404) return { likes: {} }
+	if (!res.ok) throw new Error(`read likes failed: ${res.status}`)
+	return { likes: (await res.json()) as LikesMap }
+}
+
 async function readLikesFromGithub(): Promise<LikesMap> {
 	// 优先走 Contents API：无 CDN 缓存，写入后立即可读；无凭据时回退 raw（约 5 分钟 CDN 延迟）
 	const credential = await getCredentialCached()
@@ -114,12 +138,14 @@ export async function readLikes(): Promise<LikesMap> {
 	}
 }
 
-async function writeLikes(likes: LikesMap, message: string): Promise<void> {
+/**
+ * 用「读取时拿到的同一个 sha」做 PUT（GitHub 乐观锁）：并发写入时后到者
+ * 会收到 409 而不是静默覆盖。之前先读数再重新取 sha 的写法让乐观锁失效，
+ * 并发点赞会互相覆盖丢计数。
+ */
+async function writeLikes(likes: LikesMap, message: string, sha?: string): Promise<void> {
 	const token = await getCredential()
 	const headers = { ...GH_HEADERS, Authorization: `Bearer ${token}` }
-
-	const shaRes = await fetch(`${GH_API}/repos/${GITHUB_CONFIG.OWNER}/${GITHUB_CONFIG.REPO}/contents/${FILE_PATH}`, { headers })
-	const sha = shaRes.ok ? ((await shaRes.json()) as { sha: string }).sha : undefined
 
 	const putRes = await fetch(`${GH_API}/repos/${GITHUB_CONFIG.OWNER}/${GITHUB_CONFIG.REPO}/contents/${FILE_PATH}`, {
 		method: 'PUT',
@@ -133,17 +159,23 @@ async function writeLikes(likes: LikesMap, message: string): Promise<void> {
 	if (!putRes.ok) throw new Error(`write likes failed: ${putRes.status}`)
 }
 
-/** 读-改-写某个 slug 的计数，冲突时重试一次 */
+/**
+ * 读-改-写某个 slug 的计数。带读取时 sha 做 CAS，409/422 冲突时
+ * 整体重读重算，最多 5 轮；仍失败则抛错让调用方返回 500（客户端可重试）。
+ */
 export async function incrementLike(slug: string, delta: number): Promise<number> {
-	for (let attempt = 0; attempt < 2; attempt++) {
-		const likes = await readLikesFromGithub().catch((): LikesMap => ({}))
+	let lastErr: unknown = new Error('increment failed')
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const { likes, sha } = await readLikesWithSha().catch(() => ({ likes: {} as LikesMap, sha: undefined as string | undefined }))
 		const next = (likes[slug] ?? 0) + delta
 		try {
-			await writeLikes({ ...likes, [slug]: Math.max(0, next) }, `❤️ like: ${slug} ${delta > 0 ? '+1' : delta}`)
+			await writeLikes({ ...likes, [slug]: Math.max(0, next) }, `❤️ like: ${slug} ${delta > 0 ? '+1' : delta}`, sha)
 			return Math.max(0, next)
 		} catch (err) {
-			if (attempt === 1) throw err
+			lastErr = err
+			const status = Number((err as Error)?.message?.match(/(\d{3})$/)?.[1] ?? 0)
+			if (status !== 409 && status !== 422) throw err
 		}
 	}
-	throw new Error('unreachable')
+	throw lastErr
 }

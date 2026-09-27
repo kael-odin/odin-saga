@@ -22,7 +22,25 @@ function isRateLimited(key: string): boolean {
 }
 
 function clientIp(req: NextRequest): string {
-	return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown'
+	// Vercel/Cloudflare 都会把真实 IP 追加在 x-forwarded-for 末段（首段客户端可伪造）；
+	// 优先使用平台专属头
+	return (
+		req.headers.get('x-real-ip')?.trim() ||
+		req.headers.get('cf-connecting-ip')?.trim() ||
+		req.headers.get('x-forwarded-for')?.split(',').pop()?.trim() ||
+		'unknown'
+	)
+}
+
+/** 跨站请求拒绝：第三方页面可以让访客在不知情下刷赞（配合限流会被放大） */
+function isCrossSite(req: NextRequest): boolean {
+	const origin = req.headers.get('origin')
+	if (!origin) return false
+	try {
+		return new URL(origin).host !== req.headers.get('host')
+	} catch {
+		return true
+	}
 }
 
 export async function GET(req: NextRequest) {
@@ -36,6 +54,10 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
 	const slug = sanitizeSlug(req.nextUrl.searchParams.get('slug'))
 	if (!slug) return NextResponse.json({ error: 'invalid slug' }, { status: 400 })
+
+	if (isCrossSite(req)) {
+		return NextResponse.json({ error: 'cross-site like rejected' }, { status: 403 })
+	}
 
 	if (!hasWriteCredential()) {
 		return NextResponse.json({ reason: 'not_configured', error: 'server missing GITHUB_APP_PRIVATE_KEY / GITHUB_TOKEN' }, { status: 503 })
